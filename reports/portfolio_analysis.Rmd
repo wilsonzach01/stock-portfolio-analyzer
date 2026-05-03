@@ -1,0 +1,634 @@
+---
+title: "Stock Portfolio Risk & Return Analysis"
+author: "Zach Wilson"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: flatly
+    highlight: tango
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    toc_depth: 3
+    code_folding: hide
+    df_print: kable
+params:
+  db_path: "data/portfolio.db"
+  risk_free_rate: 0.05
+  start_date: "2020-01-01"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  message    = FALSE,
+  warning    = FALSE,
+  fig.width  = 10,
+  fig.height = 6,
+  fig.align  = "center",
+  dpi        = 150
+)
+
+library(tidyverse)
+library(DBI)
+library(RSQLite)
+library(ggplot2)
+library(scales)
+library(kableExtra)
+library(glue)
+library(lubridate)
+library(broom)
+library(ggcorrplot)   # install.packages("ggcorrplot")
+library(patchwork)    # install.packages("patchwork")
+
+# ── Palette ───────────────────────────────────────────────────
+PALETTE_MAIN  <- c(
+  "#2C3E50", "#E74C3C", "#3498DB", "#2ECC71",
+  "#F39C12", "#9B59B6", "#1ABC9C", "#E67E22",
+  "#34495E", "#E91E63", "#00BCD4", "#8BC34A"
+)
+
+PALETTE_DIVERG <- c("#E74C3C", "#FFFFFF", "#2C3E50")  # red → white → navy
+
+THEME_REPORT <- theme_minimal(base_size = 12) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 14, margin = margin(b = 6)),
+    plot.subtitle    = element_text(color = "grey40", size = 11, margin = margin(b = 12)),
+    plot.caption     = element_text(color = "grey55", size = 9,  hjust = 0),
+    axis.title       = element_text(size = 10, color = "grey30"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "grey92"),
+    legend.position  = "bottom",
+    legend.title     = element_text(size = 9),
+    strip.text       = element_text(face = "bold")
+  )
+
+theme_set(THEME_REPORT)
+
+# ── Database connection ────────────────────────────────────────
+con <- dbConnect(SQLite(), params$db_path)
+
+# ── Load data from DB ──────────────────────────────────────────
+prices_df <- dbGetQuery(con, "
+  SELECT symbol, company, sector, benchmark, trade_date, adj_close, volume
+  FROM v_prices
+  ORDER BY symbol, trade_date
+") |> mutate(trade_date = as.Date(trade_date))
+
+returns_df <- dbGetQuery(con, "
+  SELECT symbol, sector, benchmark, trade_date, log_return, simple_return
+  FROM v_returns
+  ORDER BY symbol, trade_date
+") |> mutate(trade_date = as.Date(trade_date))
+
+risk_df <- dbGetQuery(con, "
+  SELECT symbol, company, sector,
+         ann_return_pct, ann_vol_pct, sharpe,
+         max_drawdown_pct, beta, alpha_pct,
+         var_95_pct, cvar_95_pct
+  FROM v_risk_summary
+")
+
+tickers_meta <- dbGetQuery(con, "SELECT symbol, company, sector, benchmark FROM tickers")
+
+# Portfolio symbols only (exclude benchmark)
+port_syms   <- tickers_meta |> filter(benchmark == 0) |> pull(symbol)
+port_colors <- setNames(PALETTE_MAIN[seq_along(port_syms)], port_syms)
+```
+
+---
+
+## Executive Summary
+
+This report analyzes a **`r length(port_syms)`-security equity portfolio** spanning
+`r format(min(prices_df$trade_date), "%B %Y")` through `r format(max(prices_df$trade_date), "%B %Y")`,
+covering `r comma(n_distinct(returns_df$trade_date[returns_df$benchmark == 0]))` trading days.
+The benchmark is **SPY** (SPDR S&P 500 ETF).
+
+Analysis includes:
+
+- Cumulative return and drawdown trajectories
+- Annualized risk/return metrics (volatility, Sharpe ratio, max drawdown)
+- CAPM regression: beta, Jensen's alpha, and R²
+- Historical Value at Risk (VaR) and Conditional VaR at 95% confidence
+- Pairwise correlation matrix
+- Hypothesis testing on mean daily returns
+
+> **Risk-free rate assumption:** `r percent(params$risk_free_rate, accuracy = 0.1)` annualized
+> (approximate U.S. Treasury rate; adjust in report params as needed).
+
+---
+
+## 1. Cumulative Returns
+
+Cumulative log returns reveal how each security compounded over the full period.
+Returns are indexed to **1.0 on `r format(min(prices_df$trade_date), "%B %d, %Y")`**.
+
+```{r cumulative-returns, fig.height=7}
+cum_returns <- returns_df |>
+  arrange(symbol, trade_date) |>
+  group_by(symbol) |>
+  mutate(cum_return = exp(cumsum(replace_na(log_return, 0)))) |>
+  ungroup()
+
+benchmark_line <- cum_returns |> filter(benchmark == 1)
+portfolio_lines <- cum_returns |> filter(benchmark == 0)
+
+ggplot() +
+  geom_line(
+    data  = portfolio_lines,
+    aes(x = trade_date, y = cum_return, color = symbol),
+    size  = 0.7, alpha = 0.85
+  ) +
+  geom_line(
+    data  = benchmark_line,
+    aes(x = trade_date, y = cum_return),
+    color = "black", size = 1.1, linetype = "dashed"
+  ) +
+  annotate(
+    "text",
+    x     = max(benchmark_line$trade_date) + days(10),
+    y     = tail(benchmark_line$cum_return, 1),
+    label = "SPY",
+    hjust = 0, size = 3.2, fontface = "bold"
+  ) +
+  scale_color_manual(values = port_colors) +
+  scale_y_continuous(labels = label_number(suffix = "×", accuracy = 0.1)) +
+  scale_x_date(date_breaks = "6 months", date_labels = "%b '%y") +
+  labs(
+    title    = "Cumulative Returns by Security",
+    subtitle = "Indexed to 1.0 at start date | Dashed = SPY benchmark",
+    x        = NULL, y = "Growth of $1",
+    color    = NULL,
+    caption  = "Source: Yahoo Finance via quantmod"
+  )
+```
+
+---
+
+## 2. Risk / Return Summary
+
+### 2.1 Summary Table
+
+```{r risk-table}
+risk_df |>
+  arrange(desc(sharpe)) |>
+  mutate(across(where(is.numeric), ~ round(.x, 2))) |>
+  rename(
+    Symbol         = symbol,
+    Company        = company,
+    Sector         = sector,
+    `Ann. Return %`  = ann_return_pct,
+    `Ann. Vol %`     = ann_vol_pct,
+    `Sharpe Ratio`   = sharpe,
+    `Max DD %`       = max_drawdown_pct,
+    Beta             = beta,
+    `Alpha %`        = alpha_pct,
+    `VaR 95% %`      = var_95_pct,
+    `CVaR 95% %`     = cvar_95_pct
+  ) |>
+  kbl(align = c("l","l","l", rep("r", 8))) |>
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE,
+    font_size         = 12
+  ) |>
+  column_spec(1, bold = TRUE) |>
+  column_spec(6, background = case_when(
+    risk_df |> arrange(desc(sharpe)) |> pull(sharpe) > 1   ~ "#d4edda",
+    risk_df |> arrange(desc(sharpe)) |> pull(sharpe) > 0   ~ "#fff3cd",
+    TRUE                                                    ~ "#f8d7da"
+  )) |>
+  add_header_above(c(" " = 3, "Return & Risk" = 3, "Drawdown" = 1, "CAPM" = 2, "Tail Risk" = 2))
+```
+
+### 2.2 Risk-Return Scatter
+
+Each point is one security. The diagonal reference line shows the theoretical
+risk/return frontier implied by the benchmark's Sharpe ratio — points above the line
+are generating more return per unit of risk than SPY.
+
+```{r risk-return-scatter, fig.height=6}
+spy_row <- dbGetQuery(con, "
+  SELECT ann_return_pct, ann_vol_pct, sharpe
+  FROM v_risk_summary
+  JOIN tickers USING (symbol)
+  -- fallback if benchmark flag not in view
+") |> slice(0)  # placeholder; we'll compute from returns
+
+spy_return <- returns_df |>
+  filter(benchmark == 1) |>
+  pull(log_return) |>
+  (\(r) (exp(mean(r, na.rm = TRUE) * 252) - 1) * 100)()
+
+spy_vol <- returns_df |>
+  filter(benchmark == 1) |>
+  pull(log_return) |>
+  (\(r) sd(r, na.rm = TRUE) * sqrt(252) * 100)()
+
+# Sharpe slope line through origin offset by RF
+rf_pct <- params$risk_free_rate * 100
+slope  <- (spy_return - rf_pct) / spy_vol
+
+vol_range <- seq(0, max(risk_df$ann_vol_pct) * 1.15, length.out = 100)
+sharpe_line <- tibble(
+  ann_vol_pct    = vol_range,
+  ann_return_pct = rf_pct + slope * vol_range
+)
+
+ggplot(risk_df, aes(x = ann_vol_pct, y = ann_return_pct, color = symbol)) +
+  geom_line(
+    data = sharpe_line,
+    aes(x = ann_vol_pct, y = ann_return_pct),
+    inherit.aes = FALSE,
+    color = "grey60", linetype = "dotted", size = 0.8
+  ) +
+  annotate("text", x = max(vol_range) * 0.85,
+           y = rf_pct + slope * max(vol_range) * 0.85,
+           label = "SPY Sharpe slope", angle = 0,
+           color = "grey50", size = 3, hjust = 0, vjust = -0.5) +
+  geom_point(size = 4, alpha = 0.9) +
+  geom_text(
+    aes(label = symbol),
+    vjust = -0.9, size = 3.2, fontface = "bold", show.legend = FALSE
+  ) +
+  geom_hline(yintercept = 0, color = "grey70", linetype = "dashed") +
+  scale_color_manual(values = port_colors, guide = "none") +
+  scale_x_continuous(labels = label_percent(scale = 1, accuracy = 1)) +
+  scale_y_continuous(labels = label_percent(scale = 1, accuracy = 1)) +
+  labs(
+    title    = "Annualized Risk vs. Return",
+    subtitle = "Dotted line = SPY capital market line | Points above line = superior risk-adjusted return",
+    x        = "Annualized Volatility (%)",
+    y        = "Annualized Return (%)",
+    caption  = glue("Risk-free rate: {percent(params$risk_free_rate, accuracy = 0.1)} | Period: {format(min(prices_df$trade_date), '%Y')}–{format(max(prices_df$trade_date), '%Y')}")
+  )
+```
+
+---
+
+## 3. Volatility & Drawdown
+
+### 3.1 Rolling 30-Day Volatility
+
+```{r rolling-vol, fig.height=7}
+rolling_vol <- returns_df |>
+  filter(benchmark == 0) |>
+  arrange(symbol, trade_date) |>
+  group_by(symbol) |>
+  mutate(
+    roll_vol = slider::slide_dbl(
+      log_return, sd, .before = 29, .complete = TRUE
+    ) * sqrt(252) * 100
+  ) |>
+  ungroup() |>
+  filter(!is.na(roll_vol))
+
+# Install slider if needed: install.packages("slider")
+
+ggplot(rolling_vol, aes(x = trade_date, y = roll_vol, color = symbol)) +
+  geom_line(size = 0.55, alpha = 0.8) +
+  scale_color_manual(values = port_colors) +
+  scale_y_continuous(labels = label_percent(scale = 1, accuracy = 1)) +
+  scale_x_date(date_breaks = "6 months", date_labels = "%b '%y") +
+  labs(
+    title    = "Rolling 30-Day Annualized Volatility",
+    subtitle = "Higher values indicate elevated short-term risk",
+    x        = NULL, y = "Annualized Vol (%)", color = NULL,
+    caption  = "Source: Yahoo Finance via quantmod"
+  )
+```
+
+### 3.2 Maximum Drawdown
+
+Drawdown measures the percentage decline from each security's historical peak —
+a key metric for loss tolerance and recovery expectations.
+
+```{r drawdown-chart, fig.height=7}
+drawdown_df <- returns_df |>
+  filter(benchmark == 0) |>
+  arrange(symbol, trade_date) |>
+  group_by(symbol) |>
+  mutate(
+    cum_ret  = exp(cumsum(replace_na(log_return, 0))),
+    roll_max = cummax(cum_ret),
+    drawdown = (cum_ret - roll_max) / roll_max * 100
+  ) |>
+  ungroup()
+
+ggplot(drawdown_df, aes(x = trade_date, y = drawdown, fill = symbol)) +
+  geom_area(alpha = 0.55, position = "identity") +
+  geom_hline(yintercept = 0, color = "grey40") +
+  facet_wrap(~ symbol, ncol = 3, scales = "free_y") +
+  scale_fill_manual(values = port_colors, guide = "none") +
+  scale_y_continuous(labels = label_percent(scale = 1, accuracy = 1)) +
+  scale_x_date(date_breaks = "1 year", date_labels = "'%y") +
+  labs(
+    title    = "Drawdown From Peak by Security",
+    subtitle = "Shaded area = percentage below all-time high",
+    x        = NULL, y = "Drawdown (%)",
+    caption  = "Source: Yahoo Finance via quantmod"
+  )
+```
+
+---
+
+## 4. CAPM Analysis
+
+The **Capital Asset Pricing Model** decomposes each security's return into:
+
+- **Beta (β):** Sensitivity to market movements. β > 1 = amplified market exposure.
+- **Alpha (α):** Excess return above what CAPM predicts. Positive alpha = outperformance.
+- **R²:** Proportion of return variance explained by the market.
+
+```{r capm-table}
+# Rebuild CAPM from returns for display
+returns_wide <- returns_df |>
+  select(symbol, trade_date, log_return) |>
+  pivot_wider(names_from = symbol, values_from = log_return)
+
+spy_col <- returns_wide[["SPY"]]
+
+capm_results <- map_dfr(port_syms, function(sym) {
+  if (!sym %in% colnames(returns_wide)) return(NULL)
+  
+  asset_col <- returns_wide[[sym]]
+  rf_daily  <- params$risk_free_rate / 252
+  
+  complete_idx <- complete.cases(data.frame(asset_col, spy_col))
+  excess_asset  <- asset_col[complete_idx]  - rf_daily
+  excess_market <- spy_col[complete_idx]    - rf_daily
+  
+  model   <- lm(excess_asset ~ excess_market)
+  t_model <- broom::tidy(model)
+  g_model <- broom::glance(model)
+  
+  tibble(
+    Symbol    = sym,
+    Alpha     = t_model$estimate[1] * 252,
+    Beta      = t_model$estimate[2],
+    `R²`      = g_model$r.squared,
+    `p (α)`   = t_model$p.value[1],
+    `p (β)`   = t_model$p.value[2],
+    n         = g_model$nobs
+  )
+})
+
+capm_results |>
+  mutate(
+    `α sig.` = case_when(`p (α)` < 0.01 ~ "***", `p (α)` < 0.05 ~ "**",
+                         `p (α)` < 0.10 ~ "*",   TRUE            ~ ""),
+    `β sig.` = case_when(`p (β)` < 0.01 ~ "***", `p (β)` < 0.05 ~ "**",
+                         `p (β)` < 0.10 ~ "*",   TRUE            ~ ""),
+    across(c(Alpha, Beta, `R²`), ~ round(.x, 3)),
+    across(c(`p (α)`, `p (β)`), ~ round(.x, 4))
+  ) |>
+  kbl(align = c("l", rep("r", 7), "c", "c")) |>
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE, font_size = 12
+  ) |>
+  column_spec(1, bold = TRUE) |>
+  footnote(
+    general = "Significance: *** p<0.01, ** p<0.05, * p<0.10 | Alpha annualized"
+  )
+```
+
+### 4.1 Beta vs. Alpha Plot
+
+```{r beta-alpha, fig.height=5}
+ggplot(capm_results, aes(x = Beta, y = Alpha * 100, color = Symbol, label = Symbol)) +
+  geom_vline(xintercept = 1,   color = "grey70", linetype = "dashed") +
+  geom_hline(yintercept = 0,   color = "grey70", linetype = "dashed") +
+  geom_point(size = 5, alpha = 0.9) +
+  geom_text(vjust = -0.9, size = 3.2, fontface = "bold", show.legend = FALSE) +
+  annotate("text", x = 1.02, y = min(capm_results$Alpha * 100) * 0.9,
+           label = "β = 1 (market)", hjust = 0, color = "grey50", size = 3) +
+  scale_color_manual(values = port_colors, guide = "none") +
+  scale_y_continuous(labels = label_percent(scale = 1, accuracy = 0.1)) +
+  labs(
+    title    = "CAPM: Beta vs. Annualized Alpha",
+    subtitle = "Top-right quadrant = high beta, positive alpha (aggressive outperformers)\nTop-left = defensive outperformers (low beta, positive alpha)",
+    x        = "Beta (β)",
+    y        = "Annualized Alpha (%)"
+  )
+```
+
+---
+
+## 5. Tail Risk: VaR & CVaR
+
+**Value at Risk (VaR, 95%):** The worst expected daily loss under normal conditions 95% of the time.
+**Conditional VaR (CVaR):** The *average* loss on the worst 5% of days — a more conservative tail risk measure.
+
+```{r var-chart, fig.height=5}
+var_plot <- risk_df |>
+  select(symbol, var_95_pct, cvar_95_pct) |>
+  pivot_longer(c(var_95_pct, cvar_95_pct), names_to = "measure", values_to = "value") |>
+  mutate(
+    measure = recode(measure,
+                     "var_95_pct"  = "VaR (95%)",
+                     "cvar_95_pct" = "CVaR (95%)"),
+    value = abs(value)   # show as positive loss magnitudes
+  )
+
+ggplot(var_plot, aes(x = reorder(symbol, value), y = value, fill = measure)) +
+  geom_col(position = "dodge", width = 0.65, alpha = 0.9) +
+  coord_flip() +
+  scale_fill_manual(values = c("VaR (95%)" = "#3498DB", "CVaR (95%)" = "#E74C3C")) +
+  scale_y_continuous(labels = label_percent(scale = 1, accuracy = 0.1)) +
+  labs(
+    title    = "Tail Risk: 1-Day Historical VaR and CVaR at 95% Confidence",
+    subtitle = "Bars show expected daily loss magnitude | CVaR > VaR by construction",
+    x        = NULL, y = "Loss (%)", fill = NULL,
+    caption  = "Historical (non-parametric) method — no normality assumption"
+  )
+```
+
+---
+
+## 6. Correlation Analysis
+
+### 6.1 Heatmap
+
+Correlations are based on daily log returns over the full period.
+Highly correlated assets provide limited diversification benefit.
+
+```{r correlation-heatmap, fig.height=7}
+returns_mat <- returns_df |>
+  filter(benchmark == 0) |>
+  select(symbol, trade_date, log_return) |>
+  pivot_wider(names_from = symbol, values_from = log_return) |>
+  select(-trade_date) |>
+  as.matrix()
+
+cor_mat <- cor(returns_mat, use = "pairwise.complete.obs")
+
+ggcorrplot(
+  cor_mat,
+  method    = "square",
+  type      = "lower",
+  lab       = TRUE,
+  lab_size  = 3,
+  colors    = c("#E74C3C", "white", "#2C3E50"),
+  outline.col = "white",
+  ggtheme   = theme_minimal(base_size = 11)
+) +
+  labs(
+    title    = "Pairwise Return Correlation Matrix",
+    subtitle = "Full-period daily log returns | Red = negative, Navy = positive correlation",
+    caption  = "Source: Yahoo Finance via quantmod"
+  ) +
+  theme(
+    legend.position = "right",
+    plot.title      = element_text(face = "bold", size = 14)
+  )
+```
+
+### 6.2 Correlation Distribution
+
+```{r cor-distribution, fig.height=4}
+cor_long <- cor_mat |>
+  as.data.frame() |>
+  rownames_to_column("sym_a") |>
+  pivot_longer(-sym_a, names_to = "sym_b", values_to = "correlation") |>
+  filter(sym_a < sym_b)
+
+ggplot(cor_long, aes(x = correlation)) +
+  geom_histogram(bins = 20, fill = "#3498DB", color = "white", alpha = 0.85) +
+  geom_vline(xintercept = median(cor_long$correlation),
+             linetype = "dashed", color = "#E74C3C", size = 0.8) +
+  annotate("text",
+           x     = median(cor_long$correlation) + 0.02,
+           y     = Inf, vjust = 1.5, hjust = 0,
+           label = glue("Median: {round(median(cor_long$correlation), 2)}"),
+           color = "#E74C3C", size = 3.5) +
+  scale_x_continuous(limits = c(-0.1, 1)) +
+  labs(
+    title    = "Distribution of Pairwise Correlations",
+    subtitle = glue("{nrow(cor_long)} unique pairs"),
+    x        = "Pearson Correlation", y = "Count"
+  )
+```
+
+---
+
+## 7. Hypothesis Testing
+
+**Null hypothesis:** Mean daily log return = 0 (no systematic drift).
+**Alternative:** Mean daily return > 0 (one-sided, using α = 0.05).
+
+```{r hypothesis-tests}
+hyp_results <- map_dfr(port_syms, function(sym) {
+  rets <- returns_df |>
+    filter(symbol == sym, !is.na(log_return)) |>
+    pull(log_return)
+  
+  t_res <- t.test(rets, mu = 0, alternative = "greater")
+  
+  tibble(
+    Symbol          = sym,
+    `Mean Daily Return` = mean(rets),
+    `T-Statistic`   = t_res$statistic,
+    `P-Value`       = t_res$p.value,
+    `Reject H₀ (α=0.05)` = ifelse(t_res$p.value < 0.05, "✓ Yes", "✗ No"),
+    N               = length(rets)
+  )
+})
+
+hyp_results |>
+  mutate(
+    `Mean Daily Return` = percent(`Mean Daily Return`, accuracy = 0.01),
+    `T-Statistic`       = round(`T-Statistic`, 3),
+    `P-Value`           = round(`P-Value`, 4)
+  ) |>
+  kbl(align = c("l", "r", "r", "r", "c", "r")) |>
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE, font_size = 12
+  ) |>
+  column_spec(1, bold = TRUE) |>
+  column_spec(5, bold = TRUE,
+              color = ifelse(
+                grepl("Yes", hyp_results$`Reject H₀ (α=0.05)`),
+                "#27AE60", "#E74C3C"
+              )) |>
+  footnote(general = "H₀: μ = 0 | H₁: μ > 0 | One-sample t-test, one-sided")
+```
+
+---
+
+## 8. Return Distributions
+
+Daily return distributions reveal skewness, fat tails, and departure from normality —
+all important for understanding model assumptions.
+
+```{r return-distributions, fig.height=8}
+returns_df |>
+  filter(benchmark == 0, !is.na(log_return)) |>
+  ggplot(aes(x = log_return * 100, fill = symbol)) +
+  geom_histogram(
+    aes(y = after_stat(density)),
+    bins  = 50, alpha = 0.75, color = NA
+  ) +
+  stat_function(
+    fun  = dnorm,
+    args = list(
+      mean = 0,
+      sd   = returns_df |>
+               filter(!is.na(log_return)) |>
+               pull(log_return) |>
+               sd() * 100
+    ),
+    color = "grey40", linetype = "dashed", size = 0.6
+  ) +
+  facet_wrap(~ symbol, ncol = 3, scales = "free_x") +
+  scale_fill_manual(values = port_colors, guide = "none") +
+  labs(
+    title    = "Daily Log Return Distributions",
+    subtitle = "Dashed curve = theoretical normal | Fat tails indicate excess kurtosis",
+    x        = "Daily Log Return (%)", y = "Density",
+    caption  = "Source: Yahoo Finance via quantmod"
+  )
+```
+
+---
+
+## 9. Summary & Key Findings
+
+```{r key-findings, results='asis'}
+top_sharpe  <- risk_df |> slice_max(sharpe, n = 1)
+worst_dd    <- risk_df |> slice_min(max_drawdown_pct, n = 1)
+lowest_beta <- risk_df |> slice_min(beta, n = 1)
+highest_alpha <- risk_df |> arrange(desc(alpha_pct)) |> slice(1)
+pct_reject  <- mean(grepl("Yes", hyp_results$`Reject H₀ (α=0.05)`)) * 100
+
+cat(glue("
+**Best risk-adjusted return:** {top_sharpe$symbol} had the highest Sharpe ratio
+({round(top_sharpe$sharpe, 2)}), indicating the most efficient return per unit of risk.
+
+**Largest drawdown:** {worst_dd$symbol} experienced the deepest peak-to-trough
+decline ({round(worst_dd$max_drawdown_pct, 1)}%), highlighting elevated downside risk.
+
+**Lowest market sensitivity:** {lowest_beta$symbol} had the lowest beta
+({round(lowest_beta$beta, 2)}), offering the most defensive exposure to market swings.
+
+**Strongest alpha:** {highest_alpha$symbol} generated the highest annualized alpha
+({round(highest_alpha$alpha_pct, 2)}%), indicating consistent market outperformance
+beyond what CAPM predicts.
+
+**Positive mean returns:** {round(pct_reject, 0)}% of securities rejected the null
+hypothesis of zero mean daily return at α = 0.05, suggesting most holdings have
+exhibited a statistically significant positive drift over the analysis period.
+"))
+```
+
+---
+
+```{r cleanup, include=FALSE}
+dbDisconnect(con)
+```
+
+*Report generated with R `r R.version$major`.`r R.version$minor` |
+quantmod · tidyverse · ggplot2 · kableExtra | Data: Yahoo Finance*
